@@ -72,116 +72,6 @@ export default function App() {
   const { getExtensions, addExtension, read } = useConfig();
   const initAttemptedRef = useRef(false);
 
-  useEffect(() => {
-    // Skip if feature flag is not enabled
-    if (!process.env.ALPHA) {
-      return;
-    }
-
-    console.log('Alpha flow initializing...');
-
-    // First quickly check if we have model and provider to set chat view
-    const checkRequiredConfig = async () => {
-      try {
-        console.log('Reading GOOSE_PROVIDER and GOOSE_MODEL from config...');
-        const provider = (await read('GOOSE_PROVIDER', false)) as string;
-        const model = (await read('GOOSE_MODEL', false)) as string;
-
-        if (provider && model) {
-          // We have all needed configuration, set chat view immediately
-          console.log(`Found provider: ${provider}, model: ${model}, setting chat view`);
-          setView('chat');
-
-          // Initialize the system in background
-          initializeSystem(provider, model)
-            .then(() => console.log('System initialization successful'))
-            .catch((error) => {
-              console.error('Error initializing system:', error);
-              setFatalError(`System initialization error: ${error.message || 'Unknown error'}`);
-              setView('welcome');
-            });
-        } else {
-          // Missing configuration, show onboarding
-          console.log('Missing configuration, showing onboarding');
-          if (!provider) console.log('Missing provider');
-          if (!model) console.log('Missing model');
-          setView('welcome');
-        }
-      } catch (error) {
-        console.error('Error checking configuration:', error);
-        setFatalError(`Configuration check error: ${error.message || 'Unknown error'}`);
-        setView('welcome');
-      }
-    };
-
-    // Setup extensions in parallel
-    const setupExtensions = async () => {
-      // Set the ref immediately to prevent duplicate runs
-      initAttemptedRef.current = true;
-
-      let refreshedExtensions: FixedExtensionEntry[] = [];
-      try {
-        // Force refresh extensions from the backend to ensure we have the latest
-        console.log('Getting extensions from backend...');
-        refreshedExtensions = await getExtensions(true);
-        console.log(`Retrieved ${refreshedExtensions.length} extensions`);
-      } catch (error) {
-        console.log('Error getting extensions list');
-        return; // Exit early if we can't get the extensions list
-      }
-
-      // built-in extensions block -- just adds them to config if missing
-      try {
-        console.log('Setting up built-in extensions...');
-
-        if (refreshedExtensions.length === 0) {
-          // If we still have no extensions, this is truly a first-time setup
-          console.log('First-time setup: Adding all built-in extensions...');
-          await initializeBuiltInExtensions(addExtension);
-          console.log('Built-in extensions initialization complete');
-
-          // Refresh the extensions list after initialization
-          refreshedExtensions = await getExtensions(true);
-        } else {
-          // Extensions exist, check for any missing built-ins
-          console.log('Checking for missing built-in extensions...');
-          console.log('Current extensions:', refreshedExtensions);
-          await syncBuiltInExtensions(refreshedExtensions, addExtension);
-          console.log('Built-in extensions sync complete');
-        }
-      } catch (error) {
-        console.error('Error setting up extensions:', error);
-        // We don't set fatal error here since the app might still work without extensions
-      }
-
-      // now try to add to agent
-      console.log('Adding enabled extensions to agent...');
-      for (const extensionEntry of refreshedExtensions) {
-        if (extensionEntry.enabled) {
-          console.log(`Adding extension to agent: ${extensionEntry.name}`);
-          // need to convert to config because that's what the endpoint expects
-          const extensionConfig = extractExtensionConfig(extensionEntry);
-          // will handle toasts and also set failures to enabled = false
-          await addToAgentOnStartup({ addToConfig: addExtension, extensionConfig });
-        } else {
-          console.log(`Skipping disabled extension: ${extensionEntry.name}`);
-        }
-      }
-
-      console.log('Extensions setup complete');
-    };
-
-    // Execute the two flows in parallel for speed
-    checkRequiredConfig().catch((error) => {
-      console.error('Unhandled error in checkRequiredConfig:', error);
-      setFatalError(`Config check error: ${error.message || 'Unknown error'}`);
-    });
-
-    setupExtensions().catch((error) => {
-      console.error('Unhandled error in setupExtensions:', error);
-      // Not setting fatal error here since extensions are optional
-    });
-  }, []); // Empty dependency array since we're using initAttemptedRef
   // Utility function to extract the command from the link
   function extractCommand(link: string): string {
     const url = new URL(link);
@@ -190,133 +80,110 @@ export default function App() {
     return `${cmd} ${args.join(' ')}`.trim();
   }
 
-  // this is all settings v2 stuff
-  // Modified version of the alpha initialization flow for App.tsx
-
   useEffect(() => {
-    // Skip if feature flag is not enabled
-    if (!process.env.ALPHA) {
+    // Guard against multiple initialization attempts
+    if (initAttemptedRef.current) {
+      console.log('Initialization already attempted, skipping...');
       return;
     }
+    initAttemptedRef.current = true;
 
-    console.log('Alpha flow initializing...');
+    console.log(`Initializing app in ${process.env.ALPHA ? 'alpha' : 'standard'} mode...`);
 
-    // First quickly check if we have model and provider to set chat view
-    const checkRequiredConfig = async () => {
-      try {
-        console.log('Reading GOOSE_PROVIDER and GOOSE_MODEL from config...');
-        const provider = (await read('GOOSE_PROVIDER', false)) as string;
-        const model = (await read('GOOSE_MODEL', false)) as string;
+    const initializeApp = async () => {
+      if (process.env.ALPHA) {
+        // Alpha flow initialization
+        try {
+          const provider = (await read('GOOSE_PROVIDER', false)) as string;
+          const model = (await read('GOOSE_MODEL', false)) as string;
 
-        if (provider && model) {
-          // We have all needed configuration, set chat view immediately
-          console.log(`Found provider: ${provider}, model: ${model}, setting chat view`);
-          setView('chat');
+          if (provider && model) {
+            console.log(`Using provider: ${provider}, model: ${model}`);
+            setView('chat');
 
-          // Initialize the system and wait for it to complete before setting up extensions
-          try {
-            console.log('Initializing system before setting up extensions...');
-            await initializeSystem(provider, model);
-            console.log('System initialization successful');
-            // Now that the agent is initialized, we can safely set up extensions
-            return true;
-          } catch (error) {
-            console.error('Error initializing system:', error);
-            setFatalError(`System initialization error: ${error.message || 'Unknown error'}`);
+            try {
+              await initializeSystem(provider, model);
+
+              // Initialize or sync built-in extensions into config.yaml
+              let refreshedExtensions = await getExtensions(true);
+
+              if (refreshedExtensions.length === 0) {
+                await initializeBuiltInExtensions(addExtension);
+                refreshedExtensions = await getExtensions(true);
+              } else {
+                await syncBuiltInExtensions(refreshedExtensions, addExtension);
+              }
+
+              // Add enabled extensions to agent
+              for (const extensionEntry of refreshedExtensions) {
+                if (extensionEntry.enabled) {
+                  const extensionConfig = extractExtensionConfig(extensionEntry);
+                  await addToAgentOnStartup({ addToConfig: addExtension, extensionConfig });
+                }
+              }
+            } catch (error) {
+              console.error('Error in alpha initialization:', error);
+              setFatalError(`System initialization error: ${error.message || 'Unknown error'}`);
+              setView('welcome');
+            }
+          } else {
+            console.log('Missing required configuration, showing onboarding');
             setView('welcome');
-            return false;
           }
-        } else {
-          // Missing configuration, show onboarding
-          console.log('Missing configuration, showing onboarding');
-          if (!provider) console.log('Missing provider');
-          if (!model) console.log('Missing model');
+        } catch (error) {
+          console.error('Error in alpha config check:', error);
+          setFatalError(`Configuration error: ${error.message || 'Unknown error'}`);
           setView('welcome');
-          return false;
         }
-      } catch (error) {
-        console.error('Error checking configuration:', error);
-        setFatalError(`Configuration check error: ${error.message || 'Unknown error'}`);
-        setView('welcome');
-        return false;
-      }
-    };
+      } else {
+        // Non-alpha flow initialization - will go away after Settings V2 ships
+        try {
+          const config = window.electron.getConfig();
+          console.log('Loaded config:', JSON.stringify(config));
 
-    // Setup extensions after agent is initialized
-    const setupExtensions = async () => {
-      // Set the ref immediately to prevent duplicate runs
-      initAttemptedRef.current = true;
+          const storedProvider = getStoredProvider(config);
+          const storedModel = getStoredModel();
 
-      let refreshedExtensions: FixedExtensionEntry[] = [];
-      try {
-        // Force refresh extensions from the backend to ensure we have the latest
-        console.log('Getting extensions from backend...');
-        refreshedExtensions = await getExtensions(true);
-        console.log(`Retrieved ${refreshedExtensions.length} extensions`);
-      } catch (error) {
-        console.log('Error getting extensions list');
-        return; // Exit early if we can't get the extensions list
-      }
-
-      // built-in extensions block -- just adds them to config if missing
-      try {
-        console.log('Setting up built-in extensions...');
-
-        if (refreshedExtensions.length === 0) {
-          // If we still have no extensions, this is truly a first-time setup
-          console.log('First-time setup: Adding all built-in extensions...');
-          await initializeBuiltInExtensions(addExtension);
-          console.log('Built-in extensions initialization complete');
-
-          // Refresh the extensions list after initialization
-          refreshedExtensions = await getExtensions(true);
-        } else {
-          // Extensions exist, check for any missing built-ins
-          console.log('Checking for missing built-in extensions...');
-          console.log('Current extensions:', refreshedExtensions);
-          await syncBuiltInExtensions(refreshedExtensions, addExtension);
-          console.log('Built-in extensions sync complete');
-        }
-      } catch (error) {
-        console.error('Error setting up extensions:', error);
-        // We don't set fatal error here since the app might still work without extensions
-      }
-
-      // now try to add to agent
-      console.log('Adding enabled extensions to agent...');
-      for (const extensionEntry of refreshedExtensions) {
-        if (extensionEntry.enabled) {
-          console.log(`Adding extension to agent: ${extensionEntry.name}`);
-          // need to convert to config because that's what the endpoint expects
-          const extensionConfig = extractExtensionConfig(extensionEntry);
-          // will handle toasts and also set failures to enabled = false
-          await addToAgentOnStartup({ addToConfig: addExtension, extensionConfig });
-        } else {
-          console.log(`Skipping disabled extension: ${extensionEntry.name}`);
+          if (storedProvider) {
+            setView('chat');
+            try {
+              if (config.GOOSE_PROVIDER && config.GOOSE_MODEL) {
+                await initializeSystem(config.GOOSE_PROVIDER, config.GOOSE_MODEL);
+              } else {
+                await initializeSystem(storedProvider, storedModel);
+                if (!storedModel) {
+                  const modelName = getDefaultModel(storedProvider.toLowerCase());
+                  const model = createSelectedModel(storedProvider.toLowerCase(), modelName);
+                  switchModel(model);
+                  addRecentModel(model);
+                }
+              }
+            } catch (error) {
+              console.error('Failed to initialize with stored provider:', error);
+              setFatalError(`Initialization failed: ${error.message || 'Unknown error'}`);
+              setView('welcome');
+            }
+          } else {
+            console.log('No stored provider found, showing welcome screen');
+            setView('welcome');
+          }
+        } catch (error) {
+          console.error('Error in non-alpha initialization:', error);
+          setFatalError(`Setup error: ${error.message || 'Unknown error'}`);
+          setView('welcome');
         }
       }
 
-      console.log('Extensions setup complete');
-
-      // Reset the toast service silent flag to ensure toasts work after startup
+      // Reset toast service after initialization
       toastService.configure({ silent: false });
     };
 
-    // Execute the flows sequentially to ensure agent is initialized before adding extensions
-    checkRequiredConfig()
-      .then((agentInitialized) => {
-        // Only proceed with extension setup if agent was successfully initialized
-        if (agentInitialized) {
-          return setupExtensions();
-        }
-        console.log('Skipping extension setup because agent was not initialized');
-        return Promise.resolve();
-      })
-      .catch((error) => {
-        console.error('Unhandled error in startup sequence:', error);
-        setFatalError(`Startup error: ${error.message || 'Unknown error'}`);
-      });
+    initializeApp().catch((error) => {
+      console.error('Unhandled error in initialization:', error);
+      setFatalError(`Initialization error: ${error.message || 'Unknown error'}`);
+    });
   }, []); // Empty dependency array since we're using initAttemptedRef
+
   const setView = (view: View, viewOptions: Record<any, any> = {}) => {
     console.log(`Setting view to: ${view}`, viewOptions);
     setInternalView({ view, viewOptions });
@@ -479,77 +346,7 @@ export default function App() {
   const { switchModel } = useModel(); // TODO: remove
   const { addRecentModel } = useRecentModels(); // TODO: remove
 
-  useEffect(() => {
-    if (process.env.ALPHA) {
-      return;
-    }
-
-    console.log('Non-alpha flow initializing...');
-
-    // Attempt to detect config for a stored provider
-    const detectStoredProvider = () => {
-      try {
-        const config = window.electron.getConfig();
-        console.log('Loaded config:', JSON.stringify(config));
-
-        const storedProvider = getStoredProvider(config);
-        console.log('Stored provider:', storedProvider);
-
-        if (storedProvider) {
-          setView('chat');
-        } else {
-          setView('welcome');
-        }
-      } catch (err) {
-        console.error('DETECTION ERROR:', err);
-        setFatalError(`Config detection error: ${err.message || 'Unknown error'}`);
-      }
-    };
-
-    // Initialize system if we have a stored provider
-    const setupStoredProvider = async () => {
-      try {
-        const config = window.electron.getConfig();
-
-        if (config.GOOSE_PROVIDER && config.GOOSE_MODEL) {
-          console.log('using GOOSE_PROVIDER and GOOSE_MODEL from config');
-          await initializeSystem(config.GOOSE_PROVIDER, config.GOOSE_MODEL);
-          return;
-        }
-
-        const storedProvider = getStoredProvider(config);
-        const storedModel = getStoredModel();
-
-        if (storedProvider) {
-          try {
-            await initializeSystem(storedProvider, storedModel);
-            console.log('Setup using locally stored provider:', storedProvider);
-            console.log('Setup using locally stored model:', storedModel);
-
-            if (!storedModel) {
-              const modelName = getDefaultModel(storedProvider.toLowerCase());
-              const model = createSelectedModel(storedProvider.toLowerCase(), modelName);
-              switchModel(model);
-              addRecentModel(model);
-            }
-          } catch (error) {
-            console.error('Failed to initialize with stored provider:', error);
-            setFatalError(`Initialization failed: ${error.message || 'Unknown error'}`);
-          }
-        }
-      } catch (err) {
-        console.error('SETUP ERROR:', err);
-        setFatalError(`Setup error: ${err.message || 'Unknown error'}`);
-      }
-    };
-
-    // Execute the functions with better error handling
-    detectStoredProvider();
-    setupStoredProvider().catch((err) => {
-      console.error('ASYNC SETUP ERROR:', err);
-      setFatalError(`Async setup error: ${err.message || 'Unknown error'}`);
-    });
-  }, []);
+  // Removed duplicate initialization useEffect as it's now consolidated in the single initialization flow above
 
   // keep
   if (fatalError) {
